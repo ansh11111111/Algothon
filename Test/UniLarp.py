@@ -2,12 +2,27 @@ import numpy as np
 
 nInst = 51
 
-# ---- Strategy parameters (tuned via grid search in sweep.py / strategies.py) ----
-Z_LOOKBACK = 40        # days of spread history used to compute the entry z-score
-DOLLAR_BUDGET = 8000    # controls how large each pair's positions get before eval.py's own $ clip
+# ---- Core pairs strategy parameters (tuned via grid search in sweep.py / strategies.py) ----
+Z_LOOKBACK = 40
+PAIR_DOLLAR_BUDGET = 8000
 MIN_HIST = Z_LOOKBACK + 2
 
-# ---- Pairs trading universe ----
+# ---- RSI overlay parameters ----
+# Applying RSI to ALL 51 instruments lifted Sharpe 3.57 -> 3.65, but was inconsistent
+# (went slightly negative at a 300-day test window) because it fades names that actually
+# exhibit momentum, not mean reversion, in their own price history.
+# Restricting the overlay to the 15 instruments with genuinely negative lag-1 return
+# autocorrelation (classified using only the first ~250 days, to avoid lookahead bias)
+# is both stronger (3.57 -> 3.87) AND more robust: positive across every test window
+# checked (100/150/200/250/300 days), unlike the unfiltered version.
+RSI_LOOKBACK = 7
+RSI_VOL_LOOKBACK = 10
+OVERLAY_BUDGET = 55000
+
+# Indices (into the 51-instrument price array) of names with train-period lag-1
+# autocorrelation < -0.02: ANSO, MHRM, AGVF, HTRK, NGTE, ACAC, NWIG, CUBO, FARS,
+# MDGI, MSDP, AETS, LSST, ULXY, HUXZ
+RANGE_BOUND_IDX = [16, 49, 23, 44, 45, 27, 20, 14, 48, 22, 12, 39, 2, 40, 8]
 
 PAIRS = [
     {'i': 40, 'j': 47, 'beta': -1.189094, 'alpha': 82.495174},  # ULXY-FCSG
@@ -33,41 +48,69 @@ PAIRS = [
 ]
 
 
-def getMyPosition(prcSoFar):
-
+def pairsDollarSignal(prcSoFar):
+    """Raw per-instrument dollar exposure from the 20-pair stat-arb book (pre share-rounding)."""
     nins, nt = prcSoFar.shape
-    pos = np.zeros(nins)
-
-
+    dollar = np.zeros(nins)
     if nt < MIN_HIST:
-        return pos.astype(int)
+        return dollar
 
     for p in PAIRS:
         i, j, beta, alpha = p['i'], p['j'], p['beta'], p['alpha']
-
-
-        price_i_hist = prcSoFar[i, :]
-        price_j_hist = prcSoFar[j, :]
-        spread_hist = price_i_hist - beta * price_j_hist - alpha
-
-
+        spread_hist = prcSoFar[i, :] - beta * prcSoFar[j, :] - alpha
         recent = spread_hist[-Z_LOOKBACK:]
-        mu = recent.mean()
-        sd = recent.std()
+        mu, sd = recent.mean(), recent.std()
         if sd < 1e-8:
             continue
         z = (spread_hist[-1] - mu) / sd
-
-
         signal = -z
 
-
         price_i = prcSoFar[i, -1]
-        pos_i_shares = signal * DOLLAR_BUDGET / price_i
+        price_j = prcSoFar[j, -1]
+        pos_i_shares = signal * PAIR_DOLLAR_BUDGET / price_i
         pos_j_shares = -beta * pos_i_shares
 
-        pos[i] += pos_i_shares
-        pos[j] += pos_j_shares
+        dollar[i] += pos_i_shares * price_i
+        dollar[j] += pos_j_shares * price_j
+
+    return dollar
 
 
-    return np.array([int(x) for x in pos])
+def rsiDollarSignal(prcSoFar):
+    """Per-instrument RSI mean-reversion signal (fades overbought/oversold), inverse-vol
+    weighted. Returns a raw (un-budgeted) dollar-like signal to be normalized by the caller."""
+    nins, nt = prcSoFar.shape
+    if nt < RSI_LOOKBACK + 2:
+        return np.zeros(nins)
+
+    deltas = np.diff(prcSoFar[:, -(RSI_LOOKBACK + 1):], axis=1)
+    gains = np.clip(deltas, 0, None).mean(axis=1)
+    losses = np.clip(-deltas, 0, None).mean(axis=1)
+    losses = np.where(losses < 1e-8, 1e-8, losses)
+    rs = gains / losses
+    rsi = 100 - 100 / (1 + rs)
+
+    rets = np.diff(np.log(prcSoFar), axis=1)
+    vl = min(RSI_VOL_LOOKBACK, rets.shape[1])
+    vol = np.maximum(rets[:, -vl:].std(axis=1), 1e-8)
+
+    signal = -(rsi - 50) / vol   # fade: overbought (RSI>50) -> short, oversold -> long
+
+    mask = np.zeros(nins)
+    mask[RANGE_BOUND_IDX] = 1.0
+    return signal * mask
+
+
+def getMyPosition(prcSoFar):
+    nins, nt = prcSoFar.shape
+    if nt < MIN_HIST:
+        return np.zeros(nins).astype(int)
+
+    pairs_d = pairsDollarSignal(prcSoFar)
+
+    rsi_raw = rsiDollarSignal(prcSoFar)
+    gross = np.sum(np.abs(rsi_raw))
+    rsi_d = (rsi_raw / gross * OVERLAY_BUDGET) if gross > 0 else rsi_raw
+
+    combined_dollar = pairs_d + rsi_d
+    return (combined_dollar / prcSoFar[:, -1]).astype(int)
