@@ -21,23 +21,41 @@ def valueBasket(prices):
 
     return np.dot(prices, coefficients)
 
+
+def diffFinder(prices):
+    basket_price = prices[0]
+    other_prices = prices[1:]
+
+    diff = round(basket_price - valueBasket(other_prices),2)
+
+    return(diff)
+
+
 def getMyPosition (prcSoFar):
     global currentPos
 
     # days = prcSoFar.shape[1]
 
-    today_prices = prcSoFar[:, -1] # gets all current prices
-    today_basket = today_prices[0] # ALGO price
-    today_other = today_prices[1:] # everything else
+    # today_prices = prcSoFar[:, -1] # gets today's prices
+    # today_basket = today_prices[0] # ALGO price
+    # today_other = today_prices[1:] # everything else
+    #
+    # diff = round(today_basket - valueBasket(today_other),2) # finds the difference between the things
+    # # without the round() would get numbers really close to 2dp anyways, like 0.020000000001
 
-    diff = round(today_basket - valueBasket(today_other),2) # finds the difference between the things
-    # without the round() would get numbers really close to 2dp anyways, like 0.020000000001
+    diffs = []
+    for i in range(3):   # finds the diffs for the past 3 days
+        day_prices = prcSoFar[:,-i-1]
+        diff = diffFinder(day_prices)
+        diffs.append(diff)
 
-    if diff > 0: # basket is overvalued
-        currentPos[0] += 1 # buy ONE basket, can experiment with quantities
-        currentPos[1:] -= 1 # sell ONE of everything else
-    elif diff < 0: # basket is undervalued
-        currentPos[0] -= 1
-        currentPos[1:] += 1
+    avg_diff = np.mean(diffs)
+
+    if avg_diff > 0: # basket is overvalued
+        currentPos[0] += 10 # buy ONE basket, can experiment with quantities
+        currentPos[1:] -= 10 # sell ONE of everything else
+    elif avg_diff < 0: # basket is undervalued
+        currentPos[0] -= 10
+        currentPos[1:] += 10
 
     return currentPos
