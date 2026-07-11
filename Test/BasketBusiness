@@ -1,0 +1,43 @@
+import numpy as np
+
+nInst=51
+currentPos = np.zeros(nInst)
+
+def valueBasket(prices):
+    # found these coefficients using R, they sum to 3 for some reason so might have to scale them down actually
+    coefficients = np.array([0.0169715288319617,0.0176051127050001,0.014949193476786,0.0312771641917854,
+                              0.0795660504605951,0.136309429887405,0.0335233454271418,0.0241266653513747,
+                              0.100861766871424,0.0453779652982834,0.131181697802378,0.0584589566259908,
+                              0.0633409038920547,0.016035175404172,0.0378748888625869,0.0482009142586522,
+                              0.159667333464859,0.0502395176631227,0.0191934620275242,0.0165989852062022,
+                              0.0254232239162115,0.0138230684366999,0.0146270175075003,0.0528722456725141,
+                              0.0231208911278189,0.114899997768844,0.0274107094723161,0.00690130334398807,
+                              0.129303694263023,0.0364894259934032,0.122589959823627,0.0838166513872357,
+                              0.0896063562420657,0.0147657681606578,0.0597476906230396,0.0548519517486965,
+                              0.0265772234077065,0.0830055244846674,0.0464257183688333,0.0443475526318752,
+                              0.0383274107379601,0.0631097229512295,0.105825667726963,0.185501713220843,
+                              0.0374950025751313,0.0612135179408445,0.0734601393759236,0.0297361858128732,
+                              0.0888520122074269,0.0443283357316006])
+
+    return np.dot(prices, coefficients)
+
+def getMyPosition (prcSoFar):
+    global currentPos
+
+    # days = prcSoFar.shape[1]
+
+    today_prices = prcSoFar[:, -1] # gets all current prices
+    today_basket = today_prices[0] # ALGO price
+    today_other = today_prices[1:] # everything else
+
+    diff = round(today_basket - valueBasket(today_other),2) # finds the difference between the things
+    # without the round() would get numbers really close to 2dp anyways, like 0.020000000001
+
+    if diff > 0: # basket is overvalued
+        currentPos[0] += 1 # buy ONE basket, can experiment with quantities
+        currentPos[1:] -= 1 # sell ONE of everything else
+    elif diff < 0: # basket is undervalued
+        currentPos[0] -= 1
+        currentPos[1:] += 1
+
+    return currentPos
