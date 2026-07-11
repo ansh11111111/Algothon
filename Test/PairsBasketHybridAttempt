@@ -1,0 +1,108 @@
+import numpy as np
+
+nInst = 51
+currentPos = np.zeros(nInst)
+
+# ---- Strategy parameters (tuned via grid search in sweep.py / strategies.py) ----
+Z_LOOKBACK = 40        # days of spread history used to compute the entry z-score
+DOLLAR_BUDGET = 8000    # controls how large each pair's positions get before eval.py's own $ clip
+MIN_HIST = Z_LOOKBACK + 2
+
+def valueBasket(prices):
+    # found these coefficients using R, they sum to 3 for some reason so might have to scale them down actually
+    coefficients = np.array([0.0169715288319617,0.0176051127050001,0.014949193476786,0.0312771641917854,
+                              0.0795660504605951,0.136309429887405,0.0335233454271418,0.0241266653513747,
+                              0.100861766871424,0.0453779652982834,0.131181697802378,0.0584589566259908,
+                              0.0633409038920547,0.016035175404172,0.0378748888625869,0.0482009142586522,
+                              0.159667333464859,0.0502395176631227,0.0191934620275242,0.0165989852062022,
+                              0.0254232239162115,0.0138230684366999,0.0146270175075003,0.0528722456725141,
+                              0.0231208911278189,0.114899997768844,0.0274107094723161,0.00690130334398807,
+                              0.129303694263023,0.0364894259934032,0.122589959823627,0.0838166513872357,
+                              0.0896063562420657,0.0147657681606578,0.0597476906230396,0.0548519517486965,
+                              0.0265772234077065,0.0830055244846674,0.0464257183688333,0.0443475526318752,
+                              0.0383274107379601,0.0631097229512295,0.105825667726963,0.185501713220843,
+                              0.0374950025751313,0.0612135179408445,0.0734601393759236,0.0297361858128732,
+                              0.0888520122074269,0.0443283357316006])
+
+    return np.dot(prices, coefficients)
+
+# ---- Pairs trading universe ----
+
+PAIRS = [
+    {'i': 40, 'j': 47, 'beta': -1.189094, 'alpha': 82.495174},  # ULXY-FCSG
+    {'i': 10, 'j': 46, 'beta': 1.532483, 'alpha': -6.107257},   # SMAH-ILVX
+    {'i': 29, 'j': 37, 'beta': -0.085821, 'alpha': 23.025273},  # GARI-EELT
+    {'i': 25, 'j': 46, 'beta': 1.880501, 'alpha': 26.585463},   # CTGI-ILVX
+    {'i': 31, 'j': 43, 'beta': 0.698554, 'alpha': 2.946142},    # ACIX-ITPA
+    {'i': 1, 'j': 20, 'beta': 0.654651, 'alpha': 34.771618},    # AENO-NWIG
+    {'i': 15, 'j': 25, 'beta': 0.563477, 'alpha': -3.874114},   # HRET-CTGI
+    {'i': 18, 'j': 38, 'beta': -0.695756, 'alpha': 57.608914},  # RTTH-HRND
+    {'i': 37, 'j': 46, 'beta': 1.719904, 'alpha': 32.278693},   # EELT-ILVX
+    {'i': 10, 'j': 25, 'beta': 0.627871, 'alpha': -10.038905},  # SMAH-CTGI
+    {'i': 14, 'j': 40, 'beta': 1.568719, 'alpha': 49.573165},   # CUBO-ULXY
+    {'i': 33, 'j': 42, 'beta': 0.746095, 'alpha': -1.319150},   # MTNS-BENI
+    {'i': 35, 'j': 42, 'beta': 0.927989, 'alpha': 9.033595},    # NAYO-BENI
+    {'i': 25, 'j': 37, 'beta': 0.805521, 'alpha': 18.543617},   # CTGI-EELT
+    {'i': 0, 'j': 3, 'beta': 0.262566, 'alpha': 68.909759},     # ALGO-SRNA
+    {'i': 49, 'j': 50, 'beta': 0.255513, 'alpha': 9.175624},    # MHRM-EAFC
+    {'i': 25, 'j': 29, 'beta': -5.313396, 'alpha': 173.974749}, # CTGI-GARI
+    {'i': 13, 'j': 45, 'beta': 0.539309, 'alpha': 4.035365},    # EORC-NGTE
+    {'i': 10, 'j': 13, 'beta': 1.562014, 'alpha': -6.646338},   # SMAH-EORC
+    {'i': 40, 'j': 50, 'beta': -0.885025, 'alpha': 82.522792},  # ULXY-EAFC
+]
+
+
+def getMyPosition(prcSoFar):
+
+    nins, nt = prcSoFar.shape
+    pos = np.zeros(nins)
+
+
+    if nt < MIN_HIST:
+        return pos.astype(int)
+
+    for p in PAIRS:
+        i, j, beta, alpha = p['i'], p['j'], p['beta'], p['alpha']
+
+
+        price_i_hist = prcSoFar[i, :]
+        price_j_hist = prcSoFar[j, :]
+        spread_hist = price_i_hist - beta * price_j_hist - alpha
+
+
+        recent = spread_hist[-Z_LOOKBACK:]
+        mu = recent.mean()
+        sd = recent.std()
+        if sd < 1e-8:
+            continue
+        z = (spread_hist[-1] - mu) / sd
+
+
+        signal = -z
+
+
+        price_i = prcSoFar[i, -1]
+        pos_i_shares = signal * DOLLAR_BUDGET / price_i
+        pos_j_shares = -beta * pos_i_shares
+
+        pos[i] += pos_i_shares
+        pos[j] += pos_j_shares
+
+    currentPos = np.array([int(x) for x in pos])
+
+    # basket arb
+    today_prices = prcSoFar[:, -1]  # gets all current prices
+    today_basket = today_prices[0]  # ALGO price
+    today_other = today_prices[1:]  # everything else
+
+    diff = round(today_basket - valueBasket(today_other), 2)  # finds the difference between the things
+    # without the round() would get numbers really close to 2dp anyways, like 0.020000000001
+
+    if diff > 0:  # basket is overvalued
+        currentPos[0] += 1  # buy ONE basket, can experiment with quantities
+        currentPos[1:] -= 1 # sell ONE of everything else
+    elif diff < 0:  # basket is undervalued
+        currentPos[0] -= 1
+        currentPos[1:] += 1
+
+    return currentPos
