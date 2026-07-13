@@ -1,0 +1,175 @@
+import numpy as np
+
+nInst = 51
+
+# ---- Core pairs strategy parameters (tuned via grid search in sweep.py / strategies.py) ----
+Z_LOOKBACK = 40
+PAIR_DOLLAR_BUDGET = 8000
+MIN_HIST = Z_LOOKBACK + 2
+
+# ---- Kalman filter parameters for time-varying hedge ratio (beta, alpha) ----
+# State: x_t = [beta_t, alpha_t], random-walk transition x_t = x_{t-1} + w_t
+# Observation: price_i[t] = beta_t * price_j[t] + alpha_t + v_t
+# delta controls how fast beta/alpha are allowed to drift (process noise scale).
+# Smaller delta -> smoother/slower-adapting beta. This mirrors the classic
+# Kalman pairs-trading setup (Chan, "Algorithmic Trading").
+KALMAN_DELTA = 1e-4
+KALMAN_VE = 1e-3          # observation noise variance (measurement noise)
+KALMAN_WARMUP = 30        # min points before trusting the filtered beta/alpha
+
+MIN_HIST = max(MIN_HIST, KALMAN_WARMUP + 2)
+
+# Indices (into the 51-instrument price array) of names with train-period lag-1
+# autocorrelation < -0.02: ANSO, MHRM, AGVF, HTRK, NGTE, ACAC, NWIG, CUBO, FARS,
+# MDGI, MSDP, AETS, LSST, ULXY, HUXZ
+RANGE_BOUND_IDX = [16, 49, 23, 44, 45, 27, 20, 14, 48, 22, 12, 39, 2, 40, 8]
+
+RSI_LOOKBACK = 7
+RSI_VOL_LOOKBACK = 10
+OVERLAY_BUDGET = 55000
+
+# Each pair's beta/alpha here are used ONLY as the Kalman filter's initial prior
+# (fit on training data). From there the filter adapts beta_t/alpha_t online as
+# new prices arrive, instead of keeping them frozen for the whole backtest.
+PAIRS = [
+    {'i': 40, 'j': 47, 'beta': -1.189094, 'alpha': 82.495174},  # ULXY-FCSG
+    {'i': 10, 'j': 46, 'beta': 1.532483, 'alpha': -6.107257},   # SMAH-ILVX
+    {'i': 29, 'j': 37, 'beta': -0.085821, 'alpha': 23.025273},  # GARI-EELT
+    {'i': 25, 'j': 46, 'beta': 1.880501, 'alpha': 26.585463},   # CTGI-ILVX
+    {'i': 31, 'j': 43, 'beta': 0.698554, 'alpha': 2.946142},    # ACIX-ITPA
+    {'i': 1, 'j': 20, 'beta': 0.654651, 'alpha': 34.771618},    # AENO-NWIG
+    {'i': 15, 'j': 25, 'beta': 0.563477, 'alpha': -3.874114},   # HRET-CTGI
+    {'i': 18, 'j': 38, 'beta': -0.695756, 'alpha': 57.608914},  # RTTH-HRND
+    {'i': 37, 'j': 46, 'beta': 1.719904, 'alpha': 32.278693},   # EELT-ILVX
+    {'i': 10, 'j': 25, 'beta': 0.627871, 'alpha': -10.038905},  # SMAH-CTGI
+    {'i': 14, 'j': 40, 'beta': 1.568719, 'alpha': 49.573165},   # CUBO-ULXY
+    {'i': 33, 'j': 42, 'beta': 0.746095, 'alpha': -1.319150},   # MTNS-BENI
+    {'i': 35, 'j': 42, 'beta': 0.927989, 'alpha': 9.033595},    # NAYO-BENI
+    {'i': 25, 'j': 37, 'beta': 0.805521, 'alpha': 18.543617},   # CTGI-EELT
+    {'i': 0, 'j': 3, 'beta': 0.262566, 'alpha': 68.909759},     # ALGO-SRNA
+    {'i': 49, 'j': 50, 'beta': 0.255513, 'alpha': 9.175624},    # MHRM-EAFC
+    {'i': 25, 'j': 29, 'beta': -5.313396, 'alpha': 173.974749}, # CTGI-GARI
+    {'i': 13, 'j': 45, 'beta': 0.539309, 'alpha': 4.035365},    # EORC-NGTE
+    {'i': 10, 'j': 13, 'beta': 1.562014, 'alpha': -6.646338},   # SMAH-EORC
+    {'i': 40, 'j': 50, 'beta': -0.885025, 'alpha': 82.522792},  # ULXY-EAFC
+]
+
+
+def _kalman_hedge_ratio(y, x, beta0, alpha0):
+    """
+    Run a 2-state (beta, alpha) Kalman filter over the full history of a pair,
+    modelling y_t = beta_t * x_t + alpha_t + v_t, with beta_t/alpha_t following
+    a random walk. Returns the filtered (beta, alpha) at the final timestep and
+    the innovation (prediction error) variance at the final step, which is used
+    downstream as an adaptive replacement for the rolling z-score std.
+
+    y, x: 1D arrays of prices (same length), y = instrument i, x = instrument j.
+    beta0, alpha0: prior state mean, from the original offline regression fit.
+    """
+    n = len(y)
+    state = np.array([beta0, alpha0], dtype=float)
+    # Prior state covariance: fairly loose, since beta0/alpha0 were fit offline
+    # and may be stale by the time this pair is actually traded live.
+    P = np.eye(2) * 1.0
+    Q = np.eye(2) * KALMAN_DELTA   # process noise (drift allowed per step)
+    R = KALMAN_VE                  # observation noise
+
+    innovation = 0.0
+    innovation_var = R
+
+    for t in range(n):
+        H = np.array([x[t], 1.0])  # observation matrix: y_t = H @ state + noise
+
+        # Predict step (random walk -> state unchanged, covariance inflates)
+        P = P + Q
+
+        # Update step
+        y_pred = H @ state
+        innovation = y[t] - y_pred
+        S = H @ P @ H + R            # innovation variance (scalar since 1D obs)
+        K = (P @ H) / S              # Kalman gain
+        state = state + K * innovation
+        P = P - np.outer(K, H) @ P
+
+        innovation_var = S
+
+    beta_t, alpha_t = state
+    return beta_t, alpha_t, innovation, innovation_var
+
+
+def pairsDollarSignal(prcSoFar):
+    """Raw per-instrument dollar exposure from the 20-pair stat-arb book (pre share-rounding).
+    Hedge ratios (beta, alpha) are now tracked online via a Kalman filter instead of being
+    frozen at their offline-fit values, and the spread z-score uses the filter's own
+    innovation variance instead of a fixed rolling window std."""
+    nins, nt = prcSoFar.shape
+    dollar = np.zeros(nins)
+    if nt < MIN_HIST:
+        return dollar
+
+    for p in PAIRS:
+        i, j, beta0, alpha0 = p['i'], p['j'], p['beta'], p['alpha']
+        y = prcSoFar[i, :]
+        x = prcSoFar[j, :]
+
+        beta_t, alpha_t, innovation, innovation_var = _kalman_hedge_ratio(
+            y, x, beta0, alpha0
+        )
+
+        if innovation_var < 1e-8:
+            continue
+
+        # z-score of today's spread surprise, using the Kalman filter's own
+        # adaptive innovation std in place of the old rolling-40-day std.
+        z = innovation / np.sqrt(innovation_var)
+        signal = -z
+
+        price_i = prcSoFar[i, -1]
+        price_j = prcSoFar[j, -1]
+        pos_i_shares = signal * PAIR_DOLLAR_BUDGET / price_i
+        pos_j_shares = -beta_t * pos_i_shares
+
+        dollar[i] += pos_i_shares * price_i
+        dollar[j] += pos_j_shares * price_j
+
+    return dollar
+
+
+def rsiDollarSignal(prcSoFar):
+    """Per-instrument RSI mean-reversion signal (fades overbought/oversold), inverse-vol
+    weighted. Returns a raw (un-budgeted) dollar-like signal to be normalized by the caller."""
+    nins, nt = prcSoFar.shape
+    if nt < RSI_LOOKBACK + 2:
+        return np.zeros(nins)
+
+    deltas = np.diff(prcSoFar[:, -(RSI_LOOKBACK + 1):], axis=1)
+    gains = np.clip(deltas, 0, None).mean(axis=1)
+    losses = np.clip(-deltas, 0, None).mean(axis=1)
+    losses = np.where(losses < 1e-8, 1e-8, losses)
+    rs = gains / losses
+    rsi = 100 - 100 / (1 + rs)
+
+    rets = np.diff(np.log(prcSoFar), axis=1)
+    vl = min(RSI_VOL_LOOKBACK, rets.shape[1])
+    vol = np.maximum(rets[:, -vl:].std(axis=1), 1e-8)
+
+    signal = -(rsi - 50) / vol   # fade: overbought (RSI>50) -> short, oversold -> long
+
+    mask = np.zeros(nins)
+    mask[RANGE_BOUND_IDX] = 1.0
+    return signal * mask
+
+
+def getMyPosition(prcSoFar):
+    nins, nt = prcSoFar.shape
+    if nt < MIN_HIST:
+        return np.zeros(nins).astype(int)
+
+    pairs_d = pairsDollarSignal(prcSoFar)
+
+    rsi_raw = rsiDollarSignal(prcSoFar)
+    gross = np.sum(np.abs(rsi_raw))
+    rsi_d = (rsi_raw / gross * OVERLAY_BUDGET) if gross > 0 else rsi_raw
+
+    combined_dollar = pairs_d + rsi_d
+    return (combined_dollar / prcSoFar[:, -1]).astype(int)
