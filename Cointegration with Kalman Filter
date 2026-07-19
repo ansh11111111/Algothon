@@ -1,0 +1,110 @@
+import numpy as np
+
+nInst = 51
+
+# ---- Strategy parameters ----
+DOLLAR_BUDGET = 8000
+DELTA = 1e-8          # Kalman process-noise scaling (random-walk speed of beta/alpha)
+R_WINDOW = 30         # window for adaptive observation-noise (R) refresh
+
+PAIRS = [
+    {'i': 40, 'j': 47},  # ULXY-FCSG
+    {'i': 10, 'j': 46},  # SMAH-ILVX
+    {'i': 29, 'j': 37},  # GARI-EELT
+    {'i': 25, 'j': 46},  # CTGI-ILVX
+    {'i': 31, 'j': 43},  # ACIX-ITPA
+    {'i': 1,  'j': 20},  # AENO-NWIG
+    {'i': 15, 'j': 25},  # HRET-CTGI
+    {'i': 18, 'j': 38},  # RTTH-HRND
+    {'i': 37, 'j': 46},  # EELT-ILVX
+    {'i': 10, 'j': 25},  # SMAH-CTGI
+    {'i': 14, 'j': 40},  # CUBO-ULXY
+    {'i': 33, 'j': 42},  # MTNS-BENI
+    {'i': 35, 'j': 42},  # NAYO-BENI
+    {'i': 25, 'j': 37},  # CTGI-EELT
+    {'i': 0,  'j': 3},   # ALGO-SRNA
+    {'i': 49, 'j': 50},  # MHRM-EAFC
+    {'i': 25, 'j': 29},  # CTGI-GARI
+    {'i': 13, 'j': 45},  # EORC-NGTE
+    {'i': 10, 'j': 13},  # SMAH-EORC
+    {'i': 40, 'j': 50},  # ULXY-EAFC
+]
+
+Q = (DELTA / (1 - DELTA)) * np.eye(2)
+
+# persistent per-pair Kalman state across calls
+_KF = {}  # key: (i,j) -> dict(x, P, R, nt_seen, innov_hist)
+
+
+def _init_state(pi_hist, pj_hist):
+    n = min(R_WINDOW, len(pi_hist))
+    R0 = np.var(pi_hist[:n] - pj_hist[:n]) + 1e-6
+    return dict(
+        x=np.array([1.0, 0.0]),
+        P=np.eye(2) * 1.0,
+        R=R0,
+        nt_seen=0,
+        innov_hist=[],
+    )
+
+
+def _kf_step(state, price_i_t, price_j_t):
+    x, P, R = state['x'], state['P'], state['R']
+    H = np.array([price_j_t, 1.0])
+
+    P = P + Q
+    y_pred = H @ x
+    e = price_i_t - y_pred
+    S = H @ P @ H.T + R
+    K = (P @ H) / S
+
+    x = x + K * e
+    P = P - np.outer(K, H) @ P
+
+    state['x'], state['P'] = x, P
+    state['innov_hist'].append(e)
+    if len(state['innov_hist']) > 5 * R_WINDOW:
+        state['innov_hist'] = state['innov_hist'][-5 * R_WINDOW:]
+    state['nt_seen'] += 1
+
+    if state['nt_seen'] % R_WINDOW == 0 and len(state['innov_hist']) >= R_WINDOW:
+        state['R'] = np.var(state['innov_hist'][-R_WINDOW:]) + 1e-6
+
+    z = e / np.sqrt(S)
+    return z, x[0]
+
+
+def getMyPosition(prcSoFar):
+    nins, nt = prcSoFar.shape
+    pos = np.zeros(nins)
+    if nt < 5:
+        return pos.astype(int)
+
+    for p in PAIRS:
+        i, j = p['i'], p['j']
+        key = (i, j)
+
+        if key not in _KF:
+            _KF[key] = _init_state(prcSoFar[i, :], prcSoFar[j, :])
+            start_t = 0
+        else:
+            start_t = _KF[key]['nt_seen']
+
+        state = _KF[key]
+        z, beta = None, state['x'][0]
+        # catch up any steps not yet processed (handles first call seeing full history)
+        for t in range(start_t, nt):
+            z, beta = _kf_step(state, prcSoFar[i, t], prcSoFar[j, t])
+
+        if z is None:
+            continue
+
+        signal = -z
+        price_i = prcSoFar[i, -1]
+        pos_i_shares = signal * DOLLAR_BUDGET / price_i
+        pos_j_shares = -beta * pos_i_shares
+
+        pos[i] += pos_i_shares
+        pos[j] += pos_j_shares
+
+    return np.array([int(x) for x in pos])
