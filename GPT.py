@@ -1,62 +1,132 @@
-"""Algothon 2026 — Version 1.
-
-Adaptive one-day momentum/reversal strategy:
-- Estimate whether one-day momentum has recently worked over the latest
-  100 completed signal/outcome pairs.
-- Use momentum when that trailing estimate is positive and reversal when
-  it is negative.
-- Hold equal dollar exposure per instrument, with the larger permitted
-  allocation for instrument 0.
-
-The function is deliberately stateless: every decision is computed only from
-``prcSoFar`` supplied by the evaluator.
-"""
-
 import numpy as np
 
+nInst = 51
 
-REGIME_WINDOW = 100
-DOLLARS_PER_INSTRUMENT = 5_000.0
-DOLLARS_INSTRUMENT_0 = 50_000.0
+# ---- Strategy parameters ----
+DOLLAR_BUDGET = 8000
+DELTA = 1e-8          # Kalman process-noise scaling (random-walk speed of beta/alpha)
+R_WINDOW = 30         # window for adaptive observation-noise (R) refresh
+
+PAIRS = [
+    {'i': 40, 'j': 47},  # ULXY-FCSG
+    {'i': 10, 'j': 46},  # SMAH-ILVX
+    {'i': 29, 'j': 37},  # GARI-EELT
+    {'i': 25, 'j': 46},  # CTGI-ILVX
+    {'i': 31, 'j': 43},  # ACIX-ITPA
+    {'i': 1,  'j': 20},  # AENO-NWIG
+    {'i': 15, 'j': 25},  # HRET-CTGI
+    {'i': 18, 'j': 38},  # RTTH-HRND
+    {'i': 37, 'j': 46},  # EELT-ILVX
+    {'i': 10, 'j': 25},  # SMAH-CTGI
+    {'i': 14, 'j': 40},  # CUBO-ULXY
+    {'i': 33, 'j': 42},  # MTNS-BENI
+    {'i': 35, 'j': 42},  # NAYO-BENI
+    {'i': 25, 'j': 37},  # CTGI-EELT
+    {'i': 0,  'j': 3},   # ALGO-SRNA
+    {'i': 49, 'j': 50},  # MHRM-EAFC
+    {'i': 25, 'j': 29},  # CTGI-GARI
+    {'i': 13, 'j': 45},  # EORC-NGTE
+    {'i': 10, 'j': 13},  # SMAH-EORC
+    {'i': 40, 'j': 50},  # ULXY-EAFC
+]
+
+Q = (DELTA / (1 - DELTA)) * np.eye(2)
+
+# persistent per-pair Kalman state across calls
+_KF = {}  # key: (i,j) -> dict(x, P, R, nt_seen, innov_hist)
+_LAST_NT = None
+_LAST_POS = None
+_LAST_LASTPRICE = None
 
 
-def _trailing_regime_score(prices: np.ndarray) -> float:
-    """Return the recent average payoff of one-day momentum.
+def _init_state(pi_hist, pj_hist):
+    n = min(R_WINDOW, len(pi_hist))
+    R0 = np.var(pi_hist[:n] - pj_hist[:n]) + 1e-6
+    return dict(
+        x=np.array([1.0, 0.0]),
+        P=np.eye(2) * 1.0,
+        R=R0,
+        nt_seen=0,
+        innov_hist=[],
+    )
 
-    If ``r_t`` is the return observed at day t, a one-day momentum signal
-    formed then earns ``sign(r_t) * r_{t+1}``. Only completed pairs are used,
-    so this calculation does not use future information.
-    """
-    returns = np.log(prices[:, 1:] / prices[:, :-1])
-    completed_payoffs = np.sign(returns[:, :-1]) * returns[:, 1:]
-    recent_payoffs = completed_payoffs[:, -REGIME_WINDOW:]
-    return float(np.mean(recent_payoffs))
+
+def _kf_step(state, price_i_t, price_j_t):
+    x, P, R = state['x'], state['P'], state['R']
+    H = np.array([price_j_t, 1.0])
+
+    P = P + Q
+    y_pred = H @ x
+    e = price_i_t - y_pred
+    S = H @ P @ H.T + R
+    K = (P @ H) / S
+
+    x = x + K * e
+    I = np.eye(2)
+    KH = np.outer(K, H)
+    P = (I-KH) @ P @ (I-KH).T + R*np.outer(K,K)
+    P = 0.5*(P+P.T)
+
+    state['x'], state['P'] = x, P
+    state['innov_hist'].append(e)
+    if len(state['innov_hist']) > 5 * R_WINDOW:
+        state['innov_hist'] = state['innov_hist'][-5 * R_WINDOW:]
+    state['nt_seen'] += 1
+
+    if state['nt_seen'] % R_WINDOW == 0 and len(state['innov_hist']) >= R_WINDOW:
+        state['R'] = np.var(state['innov_hist'][-R_WINDOW:]) + 1e-6
+
+    z = e / np.sqrt(S)
+    return z, x[0]
 
 
-def getMyPosition(prcSoFar: np.ndarray) -> np.ndarray:
-    """Return target share positions for all instruments."""
-    n_instruments, n_days = prcSoFar.shape
+def getMyPosition(prcSoFar):
+    global _LAST_NT, _LAST_POS, _LAST_LASTPRICE
+    nins, nt = prcSoFar.shape
 
-    # Three prices are required to form at least one completed
-    # signal/outcome pair. Stay flat during the warm-up period.
-    if n_days < 3:
-        return np.zeros(n_instruments, dtype=int)
+    if _LAST_NT is not None:
+        if nt < _LAST_NT:
+            _KF.clear()
+            _LAST_POS = None
+            _LAST_LASTPRICE = None
+        elif nt == _LAST_NT and _LAST_LASTPRICE is not None:
+            if np.array_equal(prcSoFar[:, -1], _LAST_LASTPRICE):
+                return _LAST_POS.copy()
+            _KF.clear()
 
-    current_prices = prcSoFar[:, -1]
+    pos = np.zeros(nins)
+    if nt < 5:
+        return pos.astype(int)
 
-    # Defensive handling for malformed prices, although the supplied data is
-    # expected to contain strictly positive finite values.
-    if np.any(~np.isfinite(current_prices)) or np.any(current_prices <= 0):
-        return np.zeros(n_instruments, dtype=int)
+    for p in PAIRS:
+        i, j = p['i'], p['j']
+        key = (i, j)
 
-    regime_score = _trailing_regime_score(prcSoFar)
-    regime = np.sign(regime_score)
+        if key not in _KF:
+            _KF[key] = _init_state(prcSoFar[i, :], prcSoFar[j, :])
+            start_t = 0
+        else:
+            start_t = _KF[key]['nt_seen']
 
-    last_return = np.log(current_prices / prcSoFar[:, -2])
-    signal = regime * np.sign(last_return)
+        state = _KF[key]
+        z, beta = None, state['x'][0]
+        # catch up any steps not yet processed (handles first call seeing full history)
+        for t in range(start_t, nt):
+            z, beta = _kf_step(state, prcSoFar[i, t], prcSoFar[j, t])
 
-    target_dollars = np.full(n_instruments, DOLLARS_PER_INSTRUMENT)
-    target_dollars[0] = DOLLARS_INSTRUMENT_0
+        if z is None:
+            continue
 
-    target_shares = signal * target_dollars / current_prices
-    return np.trunc(target_shares).astype(int)
+        signal = -z
+        price_i = prcSoFar[i, -1]
+        pos_i_shares = signal * DOLLAR_BUDGET / price_i
+        pos_j_shares = -beta * pos_i_shares
+
+        pos[i] += pos_i_shares
+        pos[j] += pos_j_shares
+
+    out = np.array([int(x) for x in pos])
+    _LAST_NT = nt
+    _LAST_POS = out.copy()
+    _LAST_LASTPRICE = prcSoFar[:, -1].copy()
+    return out
